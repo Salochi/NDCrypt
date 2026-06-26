@@ -575,6 +575,7 @@ let ws, cryptoEngine;
 let isSecure   = false;
 let isAlice    = false;   // true if this peer initiated the handshake
 let myNonce    = 0;       // [C3] seed-derived base + local counter, masked to 31 bits
+const seenNonces = new Set();
 
 // [C1] Key confirmation, using ONLY the existing NDCrypt encrypt_bytes /
 // decrypt_bytes exports — no hash function, no external library, no new
@@ -597,6 +598,16 @@ let pendingSessionId = null;  // set when we send our pubkey; routing only
 
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
+
+function chunkAad(kind, transferId, chunkIndex, totalChunks, totalBytes) {
+  return encoder.encode(JSON.stringify({
+    kind,
+    transferId,
+    chunkIndex,
+    totalChunks,
+    totalBytes: totalBytes == null ? null : totalBytes,
+  }));
+}
 
 // ── Transfer framing ───────────────────────────────────────────────────────
 //
@@ -676,7 +687,8 @@ async function sendChunks(kind, transferId, bytes, onProgress) {
     // silently dropped by the relay's per-IP token bucket.
     await throttleSend();
 
-    const encArr = cryptoEngine.encrypt_bytes(chunks[i], myNonce);
+    const aad = chunkAad(kind, transferId, i, totalChunks, bytes.length);
+    const encArr = cryptoEngine.encrypt_bytes_aad(chunks[i], myNonce, aad);
     ws.send(JSON.stringify({
       type:        'ndcrypt',
       kind,
@@ -867,12 +879,22 @@ function connect() {
       const { kind, transferId, chunkIndex, totalChunks, totalBytes, nonce, array } = data;
       if (kind !== 'meta' && kind !== 'data') return;
       if (!Number.isInteger(transferId) || !Number.isInteger(chunkIndex) || !Number.isInteger(totalChunks)) return;
+      if (!Number.isInteger(nonce) || nonce < 0 || nonce > MSG_NONCE_MASK) return;
+      if (!Array.isArray(array) || array.length !== 1040) return;
+      if (seenNonces.has(nonce)) return;
 
       const arr = new Uint16Array(array);
-      const rawBytes = cryptoEngine.decrypt_bytes(arr, nonce);
-      if (rawBytes == null) return;   // an empty (0-byte) chunk is valid; only a hard decrypt failure bails
+      const aad = chunkAad(kind, transferId, chunkIndex, totalChunks, totalBytes);
+      let rawBytes;
+      try {
+        rawBytes = cryptoEngine.decrypt_bytes_aad(arr, nonce, aad);
+      } catch {
+        return;
+      }
+      seenNonces.add(nonce);
 
       const buf = getBuffer(transferId, kind, totalChunks);
+      if (buf.chunks[chunkIndex] !== undefined) return;
       buf.chunks[chunkIndex] = rawBytes;
       buf.received++;
 
@@ -900,6 +922,7 @@ function connect() {
 
 function markSecure(role) {
   isSecure = true;
+  seenNonces.clear();
   dot.className = 'secure';
   statusText.textContent  = `E2EE Secure (${role})`;
   handshakeStatus.textContent = 'Quantum-resistant tunnel established.';

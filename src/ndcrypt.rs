@@ -1,10 +1,10 @@
-use sha3::{Digest, Sha3_256};
-use rand::SeedableRng;
 use rand::RngCore;
+use rand::SeedableRng;
 use rand::rngs::StdRng;
+use sha3::{Digest, Sha3_256};
 
-use crate::params::{N, Q, SIGNAL_COUNT};
 use crate::gka::{RingElement, derive_signal_indices};
+use crate::params::{N, Q, SIGNAL_COUNT};
 
 // ── Error type ────────────────────────────────────────────────────────────────
 
@@ -54,10 +54,12 @@ fn derive_mac_key(seed: &[u8; 32]) -> [u8; 32] {
 // The nonce is included so a tag computed for one point cannot be transplanted
 // onto a different point at the same position in a different session.
 // The mac_key binds the tag to the shared seed so only the two parties can verify it.
-fn compute_mac(mac_key: &[u8; 32], nonce: u64, ct: &RingElement) -> [u8; 32] {
+fn compute_mac_with_aad(mac_key: &[u8; 32], nonce: u64, aad: &[u8], ct: &RingElement) -> [u8; 32] {
     let mut h = Sha3_256::new();
     h.update(mac_key);
     h.update(nonce.to_le_bytes());
+    h.update((aad.len() as u64).to_le_bytes());
+    h.update(aad);
     for coeff in ct.coeffs.iter() {
         h.update(coeff.to_le_bytes());
     }
@@ -152,7 +154,11 @@ fn derive_keystream_zq(seed: &[u8; 32], nonce: u64, count: usize) -> Vec<u16> {
 //
 // Maximum message: SIGNAL_COUNT - 1 = 31 bytes per point.
 // For longer messages the caller increments the nonce and sends another point.
-pub(crate) fn encrypt(message: &[u8], seed: &[u8; 32], nonce: u64) -> Result<RingElement, NdCryptError> {
+pub(crate) fn encrypt(
+    message: &[u8],
+    seed: &[u8; 32],
+    nonce: u64,
+) -> Result<RingElement, NdCryptError> {
     if message.len() >= SIGNAL_COUNT {
         return Err(NdCryptError::MessageTooLong);
     }
@@ -190,7 +196,11 @@ pub(crate) fn encrypt(message: &[u8], seed: &[u8; 32], nonce: u64) -> Result<Rin
 // Reconstructs signal indices and keystream from (seed, nonce), then extracts
 // and unmasks each signal coordinate in reverse.
 // Decoding: value = (signal_coord + Q - mask) % Q, then take low 8 bits for bytes.
-pub(crate) fn decrypt(point: &RingElement, seed: &[u8; 32], nonce: u64) -> Result<Vec<u8>, NdCryptError> {
+pub(crate) fn decrypt(
+    point: &RingElement,
+    seed: &[u8; 32],
+    nonce: u64,
+) -> Result<Vec<u8>, NdCryptError> {
     let signal_indices = derive_signal_indices(seed, nonce);
     // Recover the length first using only the first keystream word.
     let len_keystream = derive_keystream_zq(seed, nonce, 1);
@@ -233,13 +243,22 @@ pub(crate) fn decrypt(point: &RingElement, seed: &[u8; 32], nonce: u64) -> Resul
 // and the plaintext is never returned.
 pub fn encrypt_authenticated(
     payload: &[u8],
-    seed:    &[u8; 32],
-    nonce:   u64,
+    seed: &[u8; 32],
+    nonce: u64,
+) -> Result<Vec<u16>, NdCryptError> {
+    encrypt_authenticated_with_aad(payload, seed, nonce, &[])
+}
+
+pub fn encrypt_authenticated_with_aad(
+    payload: &[u8],
+    seed: &[u8; 32],
+    nonce: u64,
+    aad: &[u8],
 ) -> Result<Vec<u16>, NdCryptError> {
     let ct = encrypt(payload, seed, nonce)?;
 
     let mac_key = derive_mac_key(seed);
-    let tag = compute_mac(&mac_key, nonce, &ct);
+    let tag = compute_mac_with_aad(&mac_key, nonce, aad, &ct);
 
     // Pack the 1024-coefficient ciphertext followed by the 16-word MAC tag.
     let mut out = Vec::with_capacity(1040);
@@ -263,8 +282,17 @@ pub fn encrypt_authenticated(
 // There is no path that returns plaintext from a modified ciphertext.
 pub fn decrypt_authenticated(
     cipher: &[u16],
-    seed:   &[u8; 32],
-    nonce:  u64,
+    seed: &[u8; 32],
+    nonce: u64,
+) -> Result<Vec<u8>, NdCryptError> {
+    decrypt_authenticated_with_aad(cipher, seed, nonce, &[])
+}
+
+pub fn decrypt_authenticated_with_aad(
+    cipher: &[u16],
+    seed: &[u8; 32],
+    nonce: u64,
+    aad: &[u8],
 ) -> Result<Vec<u8>, NdCryptError> {
     if cipher.len() != 1040 {
         return Err(NdCryptError::BadCiphertextLength);
@@ -272,7 +300,7 @@ pub fn decrypt_authenticated(
 
     // Split into ciphertext coefficients and tag words.
     let ct_coeffs = &cipher[..1024];
-    let tag_words  = &cipher[1024..];
+    let tag_words = &cipher[1024..];
 
     // Reconstruct the RingElement for MAC verification.
     let mut coeffs = [0u16; N];
@@ -283,13 +311,13 @@ pub fn decrypt_authenticated(
     let mut received_tag = [0u8; 32];
     for (i, &word) in tag_words.iter().enumerate() {
         let bytes = word.to_le_bytes();
-        received_tag[2 * i]     = bytes[0];
+        received_tag[2 * i] = bytes[0];
         received_tag[2 * i + 1] = bytes[1];
     }
 
     // Compute the expected tag independently.
     let mac_key = derive_mac_key(seed);
-    let expected_tag = compute_mac(&mac_key, nonce, &ct);
+    let expected_tag = compute_mac_with_aad(&mac_key, nonce, aad, &ct);
 
     // Constant-time comparison: fold XOR across all 32 bytes.
     // Any nonzero result means at least one byte differed — reject entirely.
@@ -322,13 +350,16 @@ pub fn decrypt_authenticated(
 // always holds odd ones (or vice-versa), so their streams can never collide even
 // if both counters start from the same low value.
 pub struct NdCryptSession {
-    seed:  [u8; 32],
+    seed: [u8; 32],
     nonce: u64,
 }
 
 impl NdCryptSession {
     pub fn new(seed: [u8; 32], nonce_base: u64) -> Self {
-        NdCryptSession { seed, nonce: nonce_base }
+        NdCryptSession {
+            seed,
+            nonce: nonce_base,
+        }
     }
 
     pub fn encrypt(&mut self, message: &[u8]) -> Result<Vec<u16>, NdCryptError> {
@@ -351,5 +382,83 @@ impl Drop for NdCryptSession {
     fn drop(&mut self) {
         use zeroize::Zeroize;
         self.seed.zeroize();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn authenticated_metadata_must_match() {
+        let seed = [0x42u8; 32];
+        let nonce = 17;
+        let payload = b"hello";
+        let aad = b"data|1|0|1|5";
+        let tampered_aad = b"data|1|1|1|5";
+
+        let cipher = encrypt_authenticated_with_aad(payload, &seed, nonce, aad).unwrap();
+
+        assert_eq!(
+            decrypt_authenticated_with_aad(&cipher, &seed, nonce, aad).unwrap(),
+            payload
+        );
+        assert!(matches!(
+            decrypt_authenticated_with_aad(&cipher, &seed, nonce, tampered_aad),
+            Err(NdCryptError::AuthenticationFailed)
+        ));
+    }
+
+    #[test]
+    fn empty_plaintext_is_distinct_from_authentication_failure() {
+        let seed = [0x24u8; 32];
+        let nonce = 23;
+        let aad = b"meta|2|0|1|0";
+        let cipher = encrypt_authenticated_with_aad(&[], &seed, nonce, aad).unwrap();
+
+        assert_eq!(
+            decrypt_authenticated_with_aad(&cipher, &seed, nonce, aad).unwrap(),
+            Vec::<u8>::new()
+        );
+        assert!(matches!(
+            decrypt_authenticated_with_aad(&cipher, &seed, nonce, b"meta|2|0|1|1"),
+            Err(NdCryptError::AuthenticationFailed)
+        ));
+    }
+
+    #[test]
+    fn poc_legacy_mac_allows_metadata_relabel_attack() {
+        let seed = [0x7au8; 32];
+        let nonce = 44;
+        let payload = b"pay bob";
+
+        let honest_metadata = br#"{"kind":"data","transferId":10,"chunkIndex":0,"totalChunks":1,"totalBytes":7}"#;
+        let attacker_metadata = br#"{"kind":"data","transferId":99,"chunkIndex":3,"totalChunks":4,"totalBytes":7}"#;
+
+        // Legacy behavior: the tag covers only nonce + ciphertext, not the
+        // plaintext envelope. A relay can move this valid chunk into a different
+        // transfer/chunk slot and decryption still succeeds.
+        let legacy_cipher = encrypt_authenticated(payload, &seed, nonce).unwrap();
+        let legacy_plaintext = decrypt_authenticated(&legacy_cipher, &seed, nonce).unwrap();
+        assert_eq!(legacy_plaintext, payload);
+        println!(
+            "POC vulnerable path: ciphertext for {:?} was accepted after relabeling to {:?}",
+            String::from_utf8_lossy(honest_metadata),
+            String::from_utf8_lossy(attacker_metadata),
+        );
+
+        // Patched behavior: the same metadata is AAD. Relabeling changes the MAC
+        // input and is rejected before plaintext is returned.
+        let patched_cipher =
+            encrypt_authenticated_with_aad(payload, &seed, nonce, honest_metadata).unwrap();
+        assert!(matches!(
+            decrypt_authenticated_with_aad(&patched_cipher, &seed, nonce, attacker_metadata),
+            Err(NdCryptError::AuthenticationFailed)
+        ));
+        assert_eq!(
+            decrypt_authenticated_with_aad(&patched_cipher, &seed, nonce, honest_metadata).unwrap(),
+            payload
+        );
+        println!("POC patched path: relabeled metadata was rejected by the AAD MAC");
     }
 }

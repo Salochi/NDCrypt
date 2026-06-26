@@ -1,14 +1,14 @@
-use wasm_bindgen::prelude::*;
 use rand::thread_rng;
+use wasm_bindgen::prelude::*;
 use zeroize::Zeroizing;
 
 // Expose all your existing files
-pub mod params;
+pub mod decrypt;
+pub mod encrypt;
 pub mod gka;
 pub mod keygen;
-pub mod encrypt;
-pub mod decrypt;
 pub mod ndcrypt;
+pub mod params;
 
 #[wasm_bindgen]
 pub struct NDCryptWasm {
@@ -32,11 +32,11 @@ impl NDCryptWasm {
     pub fn generate_keys(&mut self) -> Vec<u16> {
         let mut rng = thread_rng();
         let (pk, sk) = keygen::generate_keypair(&mut rng);
-        
+
         let mut result = Vec::with_capacity(2048);
         result.extend_from_slice(&pk.a.coeffs);
         result.extend_from_slice(&pk.b.coeffs);
-        
+
         self.pk = Some(pk);
         self.sk = Some(sk);
         return result;
@@ -55,17 +55,17 @@ impl NDCryptWasm {
         let mut b_coeffs = [0u16; 1024];
         a_coeffs.copy_from_slice(&pubkey_flat[0..1024]);
         b_coeffs.copy_from_slice(&pubkey_flat[1024..2048]);
-        
+
         let pk = keygen::PublicKey {
             a: gka::RingElement { coeffs: a_coeffs },
             b: gka::RingElement { coeffs: b_coeffs },
         };
-        
+
         let mut rng = thread_rng();
         let enc_result = encrypt::encapsulate_payload(&pk, &mut rng);
-        
+
         self.shared_seed = Some(Zeroizing::new(*enc_result.shared_seed));
-        
+
         let mut result = Vec::with_capacity(2048);
         result.extend_from_slice(&enc_result.ciphertext.c1.coeffs);
         result.extend_from_slice(&enc_result.ciphertext.c2.coeffs);
@@ -80,18 +80,18 @@ impl NDCryptWasm {
         if cipher_flat.len() != 2048 {
             return false;
         }
- 
+
         if let (Some(sk), Some(pk)) = (&self.sk, &self.pk) {
             let mut c1_coeffs = [0u16; 1024];
             let mut c2_coeffs = [0u16; 1024];
             c1_coeffs.copy_from_slice(&cipher_flat[0..1024]);
             c2_coeffs.copy_from_slice(&cipher_flat[1024..2048]);
- 
+
             let ciphertext = encrypt::Ciphertext {
                 c1: gka::RingElement { coeffs: c1_coeffs },
                 c2: gka::RingElement { coeffs: c2_coeffs },
             };
- 
+
             // FO re-encryption check happens inside decapsulate_payload. A forged
             // or corrupted ciphertext returns Err here — we must not set
             // shared_seed or report success in that case (Bug #1 regression guard).
@@ -133,7 +133,22 @@ impl NDCryptWasm {
         }
         vec![]
     }
- 
+
+    // Encrypt raw bytes and bind caller-supplied authenticated metadata.
+    // The metadata is not encrypted, but any change to it makes decryption fail.
+    pub fn encrypt_bytes_aad(
+        &self,
+        payload: &[u8],
+        nonce: u32,
+        aad: &[u8],
+    ) -> Result<Vec<u16>, JsValue> {
+        if let Some(seed) = &self.shared_seed {
+            return ndcrypt::encrypt_authenticated_with_aad(payload, &**seed, nonce as u64, aad)
+                .map_err(|e| JsValue::from_str(&format!("{:?}", e)));
+        }
+        Err(JsValue::from_str("MissingSharedSeed"))
+    }
+
     // Decrypt a 1040-u16 authenticated ciphertext (1024 coefficients + 16 MAC tag words)
     // back to raw bytes.  Returns an empty Vec on MAC failure, wrong seed, or bad length.
     pub fn decrypt_bytes(&self, cipher: &[u16], nonce: u32) -> Vec<u8> {
@@ -148,13 +163,29 @@ impl NDCryptWasm {
         vec![]
     }
 
+    // Decrypt bytes with authenticated metadata. Unlike decrypt_bytes(), this
+    // reports failures explicitly so callers can distinguish tampering from a
+    // valid empty plaintext.
+    pub fn decrypt_bytes_aad(
+        &self,
+        cipher: &[u16],
+        nonce: u32,
+        aad: &[u8],
+    ) -> Result<Vec<u8>, JsValue> {
+        if let Some(seed) = &self.shared_seed {
+            return ndcrypt::decrypt_authenticated_with_aad(cipher, &**seed, nonce as u64, aad)
+                .map_err(|e| JsValue::from_str(&format!("{:?}", e)));
+        }
+        Err(JsValue::from_str("MissingSharedSeed"))
+    }
+
     // Backwards-compatible wrappers
     pub fn encrypt_msg(&self, msg: &str, nonce: u32) -> Vec<u16> {
-        return self.encrypt_bytes(msg.as_bytes(), nonce)
+        return self.encrypt_bytes(msg.as_bytes(), nonce);
     }
- 
+
     pub fn decrypt_msg(&self, cipher: &[u16], nonce: u32) -> String {
         let bytes = self.decrypt_bytes(cipher, nonce);
-        return String::from_utf8(bytes).unwrap_or_else(|_| String::new())
+        return String::from_utf8(bytes).unwrap_or_else(|_| String::new());
     }
 }

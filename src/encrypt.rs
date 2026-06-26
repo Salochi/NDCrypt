@@ -2,7 +2,7 @@ use rand::RngCore;
 use sha3::{Digest, Sha3_256};
 use zeroize::Zeroizing;
 
-use crate::gka::{sample_small, ring_multiply, ring_add, encode_seed, fill_ring_element, RingElement};
+use crate::gka::{sample_small, ring_multiply, ring_add, encode_seed, RingElement};
 use crate::keygen::PublicKey;
 
 pub struct Ciphertext {
