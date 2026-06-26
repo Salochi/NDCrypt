@@ -1,0 +1,1270 @@
+From 5a283f1cbbf61590d95cd3c0f9f938f41b815fe4 Mon Sep 17 00:00:00 2001
+From: Salochi <nstormer72@gmail.com>
+Date: Fri, 26 Jun 2026 13:36:55 -0400
+Subject: [PATCH 1/2] Bind chunk metadata and reject replayed nonces
+
+---
+ server.py      |  31 +++++++++--
+ src/encrypt.rs |   4 +-
+ src/lib.rs     |  67 ++++++++++++++++-------
+ src/ndcrypt.rs | 143 +++++++++++++++++++++++++++++++++++++++++++------
+ 4 files changed, 204 insertions(+), 41 deletions(-)
+
+diff --git a/server.py b/server.py
+index bd5767e..4244a53 100644
+--- a/server.py
++++ b/server.py
+@@ -575,6 +575,7 @@ let ws, cryptoEngine;
+ let isSecure   = false;
+ let isAlice    = false;   // true if this peer initiated the handshake
+ let myNonce    = 0;       // [C3] seed-derived base + local counter, masked to 31 bits
++const seenNonces = new Set();
+ 
+ // [C1] Key confirmation, using ONLY the existing NDCrypt encrypt_bytes /
+ // decrypt_bytes exports — no hash function, no external library, no new
+@@ -598,6 +599,16 @@ let pendingSessionId = null;  // set when we send our pubkey; routing only
+ const encoder = new TextEncoder();
+ const decoder = new TextDecoder();
+ 
++function chunkAad(kind, transferId, chunkIndex, totalChunks, totalBytes) {
++  return encoder.encode(JSON.stringify({
++    kind,
++    transferId,
++    chunkIndex,
++    totalChunks,
++    totalBytes: totalBytes == null ? null : totalBytes,
++  }));
++}
++
+ // -- Transfer framing -------------------------------------------------------
+ //
+ // Every logical send (one text message, or one file) becomes two parallel
+@@ -676,7 +687,8 @@ async function sendChunks(kind, transferId, bytes, onProgress) {
+     // silently dropped by the relay's per-IP token bucket.
+     await throttleSend();
+ 
+-    const encArr = cryptoEngine.encrypt_bytes(chunks[i], myNonce);
++    const aad = chunkAad(kind, transferId, i, totalChunks, bytes.length);
++    const encArr = cryptoEngine.encrypt_bytes_aad(chunks[i], myNonce, aad);
+     ws.send(JSON.stringify({
+       type:        'ndcrypt',
+       kind,
+@@ -867,12 +879,22 @@ function connect() {
+       const { kind, transferId, chunkIndex, totalChunks, totalBytes, nonce, array } = data;
+       if (kind !== 'meta' && kind !== 'data') return;
+       if (!Number.isInteger(transferId) || !Number.isInteger(chunkIndex) || !Number.isInteger(totalChunks)) return;
++      if (!Number.isInteger(nonce) || nonce < 0 || nonce > MSG_NONCE_MASK) return;
++      if (!Array.isArray(array) || array.length !== 1040) return;
++      if (seenNonces.has(nonce)) return;
+ 
+       const arr = new Uint16Array(array);
+-      const rawBytes = cryptoEngine.decrypt_bytes(arr, nonce);
+-      if (rawBytes == null) return;   // an empty (0-byte) chunk is valid; only a hard decrypt failure bails
++      const aad = chunkAad(kind, transferId, chunkIndex, totalChunks, totalBytes);
++      let rawBytes;
++      try {
++        rawBytes = cryptoEngine.decrypt_bytes_aad(arr, nonce, aad);
++      } catch {
++        return;
++      }
++      seenNonces.add(nonce);
+ 
+       const buf = getBuffer(transferId, kind, totalChunks);
++      if (buf.chunks[chunkIndex] !== undefined) return;
+       buf.chunks[chunkIndex] = rawBytes;
+       buf.received++;
+ 
+@@ -900,6 +922,7 @@ function connect() {
+ 
+ function markSecure(role) {
+   isSecure = true;
++  seenNonces.clear();
+   dot.className = 'secure';
+   statusText.textContent  = `E2EE Secure (${role})`;
+   handshakeStatus.textContent = 'Quantum-resistant tunnel established.';
+@@ -1229,4 +1252,4 @@ if __name__ == "__main__":
+     try:
+         asyncio.run(main())
+     except KeyboardInterrupt:
+-        print("\nshutting down.")
+\ No newline at end of file
++        print("\nshutting down.")
+diff --git a/src/encrypt.rs b/src/encrypt.rs
+index ff87faf..7d16a70 100644
+--- a/src/encrypt.rs
++++ b/src/encrypt.rs
+@@ -2,7 +2,7 @@ use rand::RngCore;
+ use sha3::{Digest, Sha3_256};
+ use zeroize::Zeroizing;
+ 
+-use crate::gka::{sample_small, ring_multiply, ring_add, encode_seed, fill_ring_element, RingElement};
++use crate::gka::{sample_small, ring_multiply, ring_add, encode_seed, RingElement};
+ use crate::keygen::PublicKey;
+ 
+ pub struct Ciphertext {
+@@ -99,4 +99,4 @@ pub fn encapsulate_payload(pk: &PublicKey, rng: &mut impl RngCore) -> Encapsulat
+         ciphertext,
+         shared_seed: Zeroizing::new(shared_seed),
+     }
+-}
+\ No newline at end of file
++}
+diff --git a/src/lib.rs b/src/lib.rs
+index 6c5d7a0..d950b70 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -1,14 +1,14 @@
+-use wasm_bindgen::prelude::*;
+ use rand::thread_rng;
++use wasm_bindgen::prelude::*;
+ use zeroize::Zeroizing;
+ 
+ // Expose all your existing files
+-pub mod params;
++pub mod decrypt;
++pub mod encrypt;
+ pub mod gka;
+ pub mod keygen;
+-pub mod encrypt;
+-pub mod decrypt;
+ pub mod ndcrypt;
++pub mod params;
+ 
+ #[wasm_bindgen]
+ pub struct NDCryptWasm {
+@@ -32,11 +32,11 @@ impl NDCryptWasm {
+     pub fn generate_keys(&mut self) -> Vec<u16> {
+         let mut rng = thread_rng();
+         let (pk, sk) = keygen::generate_keypair(&mut rng);
+-        
++
+         let mut result = Vec::with_capacity(2048);
+         result.extend_from_slice(&pk.a.coeffs);
+         result.extend_from_slice(&pk.b.coeffs);
+-        
++
+         self.pk = Some(pk);
+         self.sk = Some(sk);
+         return result;
+@@ -55,17 +55,17 @@ impl NDCryptWasm {
+         let mut b_coeffs = [0u16; 1024];
+         a_coeffs.copy_from_slice(&pubkey_flat[0..1024]);
+         b_coeffs.copy_from_slice(&pubkey_flat[1024..2048]);
+-        
++
+         let pk = keygen::PublicKey {
+             a: gka::RingElement { coeffs: a_coeffs },
+             b: gka::RingElement { coeffs: b_coeffs },
+         };
+-        
++
+         let mut rng = thread_rng();
+         let enc_result = encrypt::encapsulate_payload(&pk, &mut rng);
+-        
++
+         self.shared_seed = Some(Zeroizing::new(*enc_result.shared_seed));
+-        
++
+         let mut result = Vec::with_capacity(2048);
+         result.extend_from_slice(&enc_result.ciphertext.c1.coeffs);
+         result.extend_from_slice(&enc_result.ciphertext.c2.coeffs);
+@@ -80,18 +80,18 @@ impl NDCryptWasm {
+         if cipher_flat.len() != 2048 {
+             return false;
+         }
+- 
++
+         if let (Some(sk), Some(pk)) = (&self.sk, &self.pk) {
+             let mut c1_coeffs = [0u16; 1024];
+             let mut c2_coeffs = [0u16; 1024];
+             c1_coeffs.copy_from_slice(&cipher_flat[0..1024]);
+             c2_coeffs.copy_from_slice(&cipher_flat[1024..2048]);
+- 
++
+             let ciphertext = encrypt::Ciphertext {
+                 c1: gka::RingElement { coeffs: c1_coeffs },
+                 c2: gka::RingElement { coeffs: c2_coeffs },
+             };
+- 
++
+             // FO re-encryption check happens inside decapsulate_payload. A forged
+             // or corrupted ciphertext returns Err here — we must not set
+             // shared_seed or report success in that case (Bug #1 regression guard).
+@@ -133,7 +133,22 @@ impl NDCryptWasm {
+         }
+         vec![]
+     }
+- 
++
++    // Encrypt raw bytes and bind caller-supplied authenticated metadata.
++    // The metadata is not encrypted, but any change to it makes decryption fail.
++    pub fn encrypt_bytes_aad(
++        &self,
++        payload: &[u8],
++        nonce: u32,
++        aad: &[u8],
++    ) -> Result<Vec<u16>, JsValue> {
++        if let Some(seed) = &self.shared_seed {
++            return ndcrypt::encrypt_authenticated_with_aad(payload, &**seed, nonce as u64, aad)
++                .map_err(|e| JsValue::from_str(&format!("{:?}", e)));
++        }
++        Err(JsValue::from_str("MissingSharedSeed"))
++    }
++
+     // Decrypt a 1040-u16 authenticated ciphertext (1024 coefficients + 16 MAC tag words)
+     // back to raw bytes.  Returns an empty Vec on MAC failure, wrong seed, or bad length.
+     pub fn decrypt_bytes(&self, cipher: &[u16], nonce: u32) -> Vec<u8> {
+@@ -148,13 +163,29 @@ impl NDCryptWasm {
+         vec![]
+     }
+ 
++    // Decrypt bytes with authenticated metadata. Unlike decrypt_bytes(), this
++    // reports failures explicitly so callers can distinguish tampering from a
++    // valid empty plaintext.
++    pub fn decrypt_bytes_aad(
++        &self,
++        cipher: &[u16],
++        nonce: u32,
++        aad: &[u8],
++    ) -> Result<Vec<u8>, JsValue> {
++        if let Some(seed) = &self.shared_seed {
++            return ndcrypt::decrypt_authenticated_with_aad(cipher, &**seed, nonce as u64, aad)
++                .map_err(|e| JsValue::from_str(&format!("{:?}", e)));
++        }
++        Err(JsValue::from_str("MissingSharedSeed"))
++    }
++
+     // Backwards-compatible wrappers
+     pub fn encrypt_msg(&self, msg: &str, nonce: u32) -> Vec<u16> {
+-        return self.encrypt_bytes(msg.as_bytes(), nonce)
++        return self.encrypt_bytes(msg.as_bytes(), nonce);
+     }
+- 
++
+     pub fn decrypt_msg(&self, cipher: &[u16], nonce: u32) -> String {
+         let bytes = self.decrypt_bytes(cipher, nonce);
+-        return String::from_utf8(bytes).unwrap_or_else(|_| String::new())
++        return String::from_utf8(bytes).unwrap_or_else(|_| String::new());
+     }
+-}
+\ No newline at end of file
++}
+diff --git a/src/ndcrypt.rs b/src/ndcrypt.rs
+index e4bfb9b..ab3d5f7 100644
+--- a/src/ndcrypt.rs
++++ b/src/ndcrypt.rs
+@@ -1,10 +1,10 @@
+-use sha3::{Digest, Sha3_256};
+-use rand::SeedableRng;
+ use rand::RngCore;
++use rand::SeedableRng;
+ use rand::rngs::StdRng;
++use sha3::{Digest, Sha3_256};
+ 
+-use crate::params::{N, Q, SIGNAL_COUNT};
+ use crate::gka::{RingElement, derive_signal_indices};
++use crate::params::{N, Q, SIGNAL_COUNT};
+ 
+ // -- Error type ----------------------------------------------------------------
+ 
+@@ -54,10 +54,12 @@ fn derive_mac_key(seed: &[u8; 32]) -> [u8; 32] {
+ // The nonce is included so a tag computed for one point cannot be transplanted
+ // onto a different point at the same position in a different session.
+ // The mac_key binds the tag to the shared seed so only the two parties can verify it.
+-fn compute_mac(mac_key: &[u8; 32], nonce: u64, ct: &RingElement) -> [u8; 32] {
++fn compute_mac_with_aad(mac_key: &[u8; 32], nonce: u64, aad: &[u8], ct: &RingElement) -> [u8; 32] {
+     let mut h = Sha3_256::new();
+     h.update(mac_key);
+     h.update(nonce.to_le_bytes());
++    h.update((aad.len() as u64).to_le_bytes());
++    h.update(aad);
+     for coeff in ct.coeffs.iter() {
+         h.update(coeff.to_le_bytes());
+     }
+@@ -152,7 +154,11 @@ fn derive_keystream_zq(seed: &[u8; 32], nonce: u64, count: usize) -> Vec<u16> {
+ //
+ // Maximum message: SIGNAL_COUNT - 1 = 31 bytes per point.
+ // For longer messages the caller increments the nonce and sends another point.
+-pub(crate) fn encrypt(message: &[u8], seed: &[u8; 32], nonce: u64) -> Result<RingElement, NdCryptError> {
++pub(crate) fn encrypt(
++    message: &[u8],
++    seed: &[u8; 32],
++    nonce: u64,
++) -> Result<RingElement, NdCryptError> {
+     if message.len() >= SIGNAL_COUNT {
+         return Err(NdCryptError::MessageTooLong);
+     }
+@@ -190,7 +196,11 @@ pub(crate) fn encrypt(message: &[u8], seed: &[u8; 32], nonce: u64) -> Result<Rin
+ // Reconstructs signal indices and keystream from (seed, nonce), then extracts
+ // and unmasks each signal coordinate in reverse.
+ // Decoding: value = (signal_coord + Q - mask) % Q, then take low 8 bits for bytes.
+-pub(crate) fn decrypt(point: &RingElement, seed: &[u8; 32], nonce: u64) -> Result<Vec<u8>, NdCryptError> {
++pub(crate) fn decrypt(
++    point: &RingElement,
++    seed: &[u8; 32],
++    nonce: u64,
++) -> Result<Vec<u8>, NdCryptError> {
+     let signal_indices = derive_signal_indices(seed, nonce);
+     // Recover the length first using only the first keystream word.
+     let len_keystream = derive_keystream_zq(seed, nonce, 1);
+@@ -233,13 +243,22 @@ pub(crate) fn decrypt(point: &RingElement, seed: &[u8; 32], nonce: u64) -> Resul
+ // and the plaintext is never returned.
+ pub fn encrypt_authenticated(
+     payload: &[u8],
+-    seed:    &[u8; 32],
+-    nonce:   u64,
++    seed: &[u8; 32],
++    nonce: u64,
++) -> Result<Vec<u16>, NdCryptError> {
++    encrypt_authenticated_with_aad(payload, seed, nonce, &[])
++}
++
++pub fn encrypt_authenticated_with_aad(
++    payload: &[u8],
++    seed: &[u8; 32],
++    nonce: u64,
++    aad: &[u8],
+ ) -> Result<Vec<u16>, NdCryptError> {
+     let ct = encrypt(payload, seed, nonce)?;
+ 
+     let mac_key = derive_mac_key(seed);
+-    let tag = compute_mac(&mac_key, nonce, &ct);
++    let tag = compute_mac_with_aad(&mac_key, nonce, aad, &ct);
+ 
+     // Pack the 1024-coefficient ciphertext followed by the 16-word MAC tag.
+     let mut out = Vec::with_capacity(1040);
+@@ -263,8 +282,17 @@ pub fn encrypt_authenticated(
+ // There is no path that returns plaintext from a modified ciphertext.
+ pub fn decrypt_authenticated(
+     cipher: &[u16],
+-    seed:   &[u8; 32],
+-    nonce:  u64,
++    seed: &[u8; 32],
++    nonce: u64,
++) -> Result<Vec<u8>, NdCryptError> {
++    decrypt_authenticated_with_aad(cipher, seed, nonce, &[])
++}
++
++pub fn decrypt_authenticated_with_aad(
++    cipher: &[u16],
++    seed: &[u8; 32],
++    nonce: u64,
++    aad: &[u8],
+ ) -> Result<Vec<u8>, NdCryptError> {
+     if cipher.len() != 1040 {
+         return Err(NdCryptError::BadCiphertextLength);
+@@ -272,7 +300,7 @@ pub fn decrypt_authenticated(
+ 
+     // Split into ciphertext coefficients and tag words.
+     let ct_coeffs = &cipher[..1024];
+-    let tag_words  = &cipher[1024..];
++    let tag_words = &cipher[1024..];
+ 
+     // Reconstruct the RingElement for MAC verification.
+     let mut coeffs = [0u16; N];
+@@ -283,13 +311,13 @@ pub fn decrypt_authenticated(
+     let mut received_tag = [0u8; 32];
+     for (i, &word) in tag_words.iter().enumerate() {
+         let bytes = word.to_le_bytes();
+-        received_tag[2 * i]     = bytes[0];
++        received_tag[2 * i] = bytes[0];
+         received_tag[2 * i + 1] = bytes[1];
+     }
+ 
+     // Compute the expected tag independently.
+     let mac_key = derive_mac_key(seed);
+-    let expected_tag = compute_mac(&mac_key, nonce, &ct);
++    let expected_tag = compute_mac_with_aad(&mac_key, nonce, aad, &ct);
+ 
+     // Constant-time comparison: fold XOR across all 32 bytes.
+     // Any nonzero result means at least one byte differed — reject entirely.
+@@ -322,13 +350,16 @@ pub fn decrypt_authenticated(
+ // always holds odd ones (or vice-versa), so their streams can never collide even
+ // if both counters start from the same low value.
+ pub struct NdCryptSession {
+-    seed:  [u8; 32],
++    seed: [u8; 32],
+     nonce: u64,
+ }
+ 
+ impl NdCryptSession {
+     pub fn new(seed: [u8; 32], nonce_base: u64) -> Self {
+-        NdCryptSession { seed, nonce: nonce_base }
++        NdCryptSession {
++            seed,
++            nonce: nonce_base,
++        }
+     }
+ 
+     pub fn encrypt(&mut self, message: &[u8]) -> Result<Vec<u16>, NdCryptError> {
+@@ -352,4 +383,82 @@ impl Drop for NdCryptSession {
+         use zeroize::Zeroize;
+         self.seed.zeroize();
+     }
+-}
+\ No newline at end of file
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn authenticated_metadata_must_match() {
++        let seed = [0x42u8; 32];
++        let nonce = 17;
++        let payload = b"hello";
++        let aad = b"data|1|0|1|5";
++        let tampered_aad = b"data|1|1|1|5";
++
++        let cipher = encrypt_authenticated_with_aad(payload, &seed, nonce, aad).unwrap();
++
++        assert_eq!(
++            decrypt_authenticated_with_aad(&cipher, &seed, nonce, aad).unwrap(),
++            payload
++        );
++        assert!(matches!(
++            decrypt_authenticated_with_aad(&cipher, &seed, nonce, tampered_aad),
++            Err(NdCryptError::AuthenticationFailed)
++        ));
++    }
++
++    #[test]
++    fn empty_plaintext_is_distinct_from_authentication_failure() {
++        let seed = [0x24u8; 32];
++        let nonce = 23;
++        let aad = b"meta|2|0|1|0";
++        let cipher = encrypt_authenticated_with_aad(&[], &seed, nonce, aad).unwrap();
++
++        assert_eq!(
++            decrypt_authenticated_with_aad(&cipher, &seed, nonce, aad).unwrap(),
++            Vec::<u8>::new()
++        );
++        assert!(matches!(
++            decrypt_authenticated_with_aad(&cipher, &seed, nonce, b"meta|2|0|1|1"),
++            Err(NdCryptError::AuthenticationFailed)
++        ));
++    }
++
++    #[test]
++    fn poc_legacy_mac_allows_metadata_relabel_attack() {
++        let seed = [0x7au8; 32];
++        let nonce = 44;
++        let payload = b"pay bob";
++
++        let honest_metadata = br#"{"kind":"data","transferId":10,"chunkIndex":0,"totalChunks":1,"totalBytes":7}"#;
++        let attacker_metadata = br#"{"kind":"data","transferId":99,"chunkIndex":3,"totalChunks":4,"totalBytes":7}"#;
++
++        // Legacy behavior: the tag covers only nonce + ciphertext, not the
++        // plaintext envelope. A relay can move this valid chunk into a different
++        // transfer/chunk slot and decryption still succeeds.
++        let legacy_cipher = encrypt_authenticated(payload, &seed, nonce).unwrap();
++        let legacy_plaintext = decrypt_authenticated(&legacy_cipher, &seed, nonce).unwrap();
++        assert_eq!(legacy_plaintext, payload);
++        println!(
++            "POC vulnerable path: ciphertext for {:?} was accepted after relabeling to {:?}",
++            String::from_utf8_lossy(honest_metadata),
++            String::from_utf8_lossy(attacker_metadata),
++        );
++
++        // Patched behavior: the same metadata is AAD. Relabeling changes the MAC
++        // input and is rejected before plaintext is returned.
++        let patched_cipher =
++            encrypt_authenticated_with_aad(payload, &seed, nonce, honest_metadata).unwrap();
++        assert!(matches!(
++            decrypt_authenticated_with_aad(&patched_cipher, &seed, nonce, attacker_metadata),
++            Err(NdCryptError::AuthenticationFailed)
++        ));
++        assert_eq!(
++            decrypt_authenticated_with_aad(&patched_cipher, &seed, nonce, honest_metadata).unwrap(),
++            payload
++        );
++        println!("POC patched path: relabeled metadata was rejected by the AAD MAC");
++    }
++}
+-- 
+2.42.0.windows.2
+
+
+From 75a6946028da9d06476bd5ed218983d722421144 Mon Sep 17 00:00:00 2001
+From: Salochi <nstormer72@gmail.com>
+Date: Fri, 26 Jun 2026 13:58:14 -0400
+Subject: [PATCH 2/2] Document security findings and POC
+
+---
+ readme.md | 637 ++++++++++++++++++++++++++----------------------------
+ 1 file changed, 312 insertions(+), 325 deletions(-)
+
+diff --git a/readme.md b/readme.md
+index 78ddaaf..00b2085 100644
+--- a/readme.md
++++ b/readme.md
+@@ -1,453 +1,440 @@
+-# NDCrypt
++# NDCrypt Security Review and Patch Notes
+ 
+-**NDCrypt** is a post-quantum end-to-end encrypted chat system built in Rust and compiled to WebAssembly. It pairs a **Ring Learning With Errors (Ring-LWE) Key Encapsulation Mechanism** with a deterministic coordinate-hiding symmetric cipher, running entirely in the browser. The relay server never sees plaintext — it only forwards opaque encrypted arrays.
++This branch documents and patches issues found during an authorized review of
++NDCrypt's encryption and message transport layer.
+ 
+----
++The most important fix is that encrypted chunks now authenticate the plaintext
++metadata that tells the receiver where a chunk belongs. Before this change, a
++relay or active network attacker could move a valid encrypted chunk into a
++different transfer or chunk slot without breaking the ciphertext tag.
+ 
+-## Architecture Overview
++Branch:
+ 
+-```
+-Browser A                      Python Relay Server               Browser B
+----------                      -------------------               ---------
+-NDCryptWasm (Rust/WASM)        server.py                         NDCryptWasm (Rust/WASM)
+-     ¦                              ¦                                  ¦
+-     ¦-- pubkey -------------------?¦-- pubkey + session_id ----------?¦
+-     ¦                              ¦                                  ¦
+-     ¦?-- ciphertext + confirm -----¦?- ciphertext + confirm ----------¦
+-     ¦                              ¦                                  ¦
+-     ¦-- confirm_ack --------------?¦-- confirm_ack ------------------?¦
+-     ¦                              ¦                                  ¦
+-     ¦?-- E2EE tunnel established --------------------------------------¦
+-     ¦                              ¦                                  ¦
+-     ¦-- { nonce, array[1024] } ---?¦-- { nonce, array[1024] } -------?¦
+-     ¦    encrypted NDCrypt point   ¦    server sees only this          ¦    decrypt with same seed
++```text
++codex/patch-authenticated-metadata-replay
+ ```
+ 
+-The server sees public keys, opaque ciphertext arrays, and nonces. It never has the shared seed, never has S, and cannot decrypt any message.
++Commit:
+ 
+----
++```text
++5a283f1 Bind chunk metadata and reject replayed nonces
++```
+ 
+-## Mathematical Parameters
++## Summary
+ 
+-All Phase 1 lattice operations occur within the polynomial quotient ring:
++### Fixed in this branch
+ 
+-R_q = Z_q[X]/(X^N + 1)
++- Message chunk metadata is now bound into the MAC as authenticated data.
++- The browser client now rejects duplicate message nonces.
++- WASM exposes explicit AAD encrypt/decrypt methods.
++- Decryption failures in the AAD path are reported explicitly instead of being
++  confused with valid empty plaintext.
++- A runnable POC/regression test demonstrates the old relabeling attack and the
++  patched rejection behavior.
+ 
+-| Parameter | Value | Reason |
+-|---|---|---|
+-| N | 1024 | Dimension — determines search space C(1024,32) ˜ 2^210 |
+-| q | 12289 | Prime equal to 3 × 2^12 + 1 — NTT-friendly field |
+-| SIGNAL_COUNT | 32 | Signal coordinates per point — 31 bytes payload capacity |
+-| Encoding scalar | 6144 = floor(q/2) | Maximally separated from 0 on the modular clock |
+-| Noise distribution ? | Centered Binomial | Coefficients in {-2, -1, 0, 1, 2} |
++### Still not fixed by this branch
+ 
+----
++- The key exchange still does not authenticate user identity.
++- The cryptographic design is custom and should not be described as proven
++  post-quantum secure.
++- The raw WASM API still exposes caller-managed nonce methods for compatibility.
++- The protocol remains very inefficient for large files because each encrypted
++  point carries at most 31 bytes of plaintext.
+ 
+-## Phase 1 — Ring-LWE Key Encapsulation
++## Architecture Reviewed
+ 
+-### Key Generation (keygen.rs)
++NDCrypt has two main cryptographic layers:
+ 
+-Alice generates a uniform polynomial a from R_q, samples a secret s from ? and error e from ?, and computes her public key:
++1. A custom Ring-LWE-style key encapsulation flow in Rust.
++2. A coordinate-hiding symmetric message layer used after both peers derive a
++   shared 32-byte seed.
+ 
+-    b = a · s + e  (mod q)
++The browser-facing Rust code is compiled to WebAssembly and used by the client
++embedded in `server.py`. The Python server is a relay. It forwards public keys,
++encapsulation ciphertexts, confirmations, nonces, plaintext chunk metadata, and
++encrypted chunk arrays.
+ 
+-- Public key: (a, b) — sent to Bob over the open relay
+-- Private key: s — never leaves Alice's browser
++Important files:
+ 
+-### Encapsulation (encrypt.rs)
++```text
++src/keygen.rs     Ring-LWE keypair generation
++src/encrypt.rs    Seed encapsulation and FO-style deterministic re-encryption
++src/decrypt.rs    Seed decapsulation and ciphertext validity check
++src/gka.rs        Ring arithmetic, NTT multiplication, seed encoding, indices
++src/ndcrypt.rs    Symmetric coordinate-hiding encryption and MAC
++src/lib.rs        WASM API exposed to browser JavaScript
++server.py         Relay server plus embedded browser client
++```
+ 
+-Bob generates a random 32-byte root seed and encodes it bit-by-bit into a message polynomial m where bit 0 maps to coefficient 0 and bit 1 maps to coefficient 6144. He samples ephemeral noise s', e', e'' from ? and produces:
++Core parameters:
+ 
+-    c1 = a · s' + e'         (mod q)
+-    c2 = b · s' + e'' + m    (mod q)
++```text
++N = 1024
++Q = 12289
++SIGNAL_COUNT = 32
++Payload per point = 31 bytes
++```
+ 
+-Bob sends (c1, c2) to Alice. His ephemeral secrets s', e', e'' are immediately discarded — they never appear in any output.
++## Main Finding: Metadata Was Not Authenticated
+ 
+-### Decapsulation (decrypt.rs)
++### Vulnerable behavior
+ 
+-Alice computes:
++Before this patch, `compute_mac` in `src/ndcrypt.rs` authenticated:
+ 
+-    c2 - c1 · s = m + (e · s' + e'' - e' · s)   (mod q)
++```text
++mac_key || nonce || ciphertext_coefficients
++```
+ 
+-The a · s · s' terms cancel exactly. The residual noise is small so it never pushes any coefficient across the decoding thresholds. Alice reads each recovered coefficient: values in (q/4, 3q/4) = (3072, 9216) decode as 1, everything else as 0. The 32-byte seed is recovered exactly.
++It did not authenticate the plaintext envelope fields sent next to the
++ciphertext in `server.py`:
+ 
+-### Polynomial Multiplication (gka.rs)
++```json
++{
++  "kind": "data",
++  "transferId": 10,
++  "chunkIndex": 0,
++  "totalChunks": 1,
++  "totalBytes": 7,
++  "nonce": 44,
++  "array": [...]
++}
++```
+ 
+-Ring multiplication uses a pure Rust negacyclic Number Theoretic Transform (NTT) over
++Those fields control how the receiver buffers and reassembles decrypted chunks.
++Because they were not covered by the MAC, an active relay could take a valid
++ciphertext and change only the envelope:
+ 
+-    Rq = Zq[X]/(X^1024 + 1)
++```json
++{
++  "kind": "data",
++  "transferId": 99,
++  "chunkIndex": 3,
++  "totalChunks": 4,
++  "totalBytes": 7,
++  "nonce": 44,
++  "array": [...]
++}
++```
+ 
+-Each multiplication performs:
++The ciphertext tag still verified because the encrypted array and nonce were
++unchanged. The receiver would then place the plaintext into the attacker-chosen
++transfer/chunk slot.
+ 
+-1. Multiply coefficients by precomputed powers of ? (pre-twist)
+-2. Forward radix-2 Cooley-Tukey NTT
+-3. Pointwise multiplication in the transform domain
+-4. Inverse NTT
+-5. Multiply by N?¹ and ??? (post-twist)
++### Impact
+ 
+-The implementation uses precomputed twiddle factors and roots of unity for q = 12289 and performs polynomial multiplication in O(N log N) time while remaining entirely pure Rust and fully WebAssembly compatible.
++An attacker controlling the relay could:
+ 
+----
++- Move a valid encrypted chunk into another transfer.
++- Change whether a chunk is treated as `meta` or `data`.
++- Reorder chunks by changing `chunkIndex`.
++- Corrupt reassembly while still passing ciphertext authentication.
++- Replay old valid chunks unless the nonce was tracked separately.
+ 
+-## Phase 2 — Coordinate Hiding Cipher (ndcrypt.rs)
++This did not reveal the shared seed directly, but it broke message integrity at
++the protocol layer. Authenticated encryption must bind all metadata that affects
++how plaintext is interpreted.
+ 
+-Once the 32-byte seed is synchronized on both sides, all messages use the coordinate hiding layer. The seed and an incrementing nonce drive every derivation.
++## Working POC
+ 
+-### Signal Index Derivation
++Run:
+ 
+-    s_seed = SHA3-256([0x01] || nonce || seed)
+-    S = Fisher-Yates shuffle of [0..1023] seeded by s_seed, first 32 indices sorted
++```powershell
++cargo test poc_legacy_mac_allows_metadata_relabel_attack -- --nocapture
++```
+ 
+-Both parties derive the same S for the same nonce. The nonce increments per point so S is never reused across messages.
++Expected output:
+ 
+-### Background Generation
++```text
++POC vulnerable path: ciphertext for "{\"kind\":\"data\",\"transferId\":10,\"chunkIndex\":0,\"totalChunks\":1,\"totalBytes\":7}" was accepted after relabeling to "{\"kind\":\"data\",\"transferId\":99,\"chunkIndex\":3,\"totalChunks\":4,\"totalBytes\":7}"
++POC patched path: relabeled metadata was rejected by the AAD MAC
++```
+ 
+-    background[i] = SHA3-256([0x03] || nonce || counter || seed) with rejection sampling
++The POC is implemented as a Rust test in `src/ndcrypt.rs`.
+ 
+-Produces 1024 values uniform over Z_q via counter-mode hashing. Rejection sampling (14-bit mask, discard >= q) ensures no bias toward any value.
++It demonstrates both sides:
+ 
+-### Masking and Embedding
++1. Legacy behavior: `encrypt_authenticated` / `decrypt_authenticated` accept the
++   ciphertext even though the surrounding metadata is relabeled, because the
++   legacy MAC has no metadata input.
++2. Patched behavior: `encrypt_authenticated_with_aad` /
++   `decrypt_authenticated_with_aad` reject the same relabeling attempt with
++   `AuthenticationFailed`.
+ 
+-For each payload byte p_i:
++## Patch Details
+ 
+-    point[S[i+1]] = (p_i + mask_i) mod q
++### 1. Added AAD MAC support
+ 
+-where mask_i = SHA3-256([0x04] || nonce || i || seed), reduced to a uniform value in [0, q).
++File:
+ 
+-Adding a uniform mask to a value and reducing mod q produces a uniform output. Signal coordinates become statistically identical to background coordinates. An attacker with the ciphertext point cannot distinguish which 32 of the 1024 coordinates carry the message.
++```text
++src/ndcrypt.rs
++```
+ 
+-The message length is hidden in signal coordinate S[0], also masked: (len + mask_0) % q. Decryption recovers the length first, then exactly that many bytes.
++The MAC now has an AAD-aware path:
+ 
+-### Domain Separation Tags
++```text
++mac_key || nonce || aad_length || aad || ciphertext_coefficients
++```
+ 
+-| Tag | Purpose |
+-|---|---|
+-| 0x01 | Signal index derivation (S) |
+-| 0x03 | Background noise generation |
+-| 0x04 | Per-slot masks |
+-| 0x05 | Nonce base derivation (party-specific starting point) |
++The `aad_length` prefix prevents ambiguous concatenation between different AAD
++byte strings.
++
++New functions:
++
++```rust
++pub fn encrypt_authenticated_with_aad(
++    payload: &[u8],
++    seed: &[u8; 32],
++    nonce: u64,
++    aad: &[u8],
++) -> Result<Vec<u16>, NdCryptError>
++
++pub fn decrypt_authenticated_with_aad(
++    cipher: &[u16],
++    seed: &[u8; 32],
++    nonce: u64,
++    aad: &[u8],
++) -> Result<Vec<u8>, NdCryptError>
++```
+ 
+-No two derivations from the same seed can interfere with each other.
++The existing `encrypt_authenticated` and `decrypt_authenticated` functions still
++exist for compatibility. They call the AAD versions with empty AAD.
+ 
+----
++### 2. Exposed AAD methods to WASM
+ 
+-## WebAssembly Interface (lib.rs)
++File:
+ 
+-The NDCryptWasm class is the browser-facing API, exposed via wasm-bindgen. Each browser tab creates one instance and holds all state (keypair, shared seed) inside it.
++```text
++src/lib.rs
++```
+ 
+-```javascript
+-const engine = new NDCryptWasm();
++New browser-facing methods:
++
++```rust
++pub fn encrypt_bytes_aad(
++    &self,
++    payload: &[u8],
++    nonce: u32,
++    aad: &[u8],
++) -> Result<Vec<u16>, JsValue>
++
++pub fn decrypt_bytes_aad(
++    &self,
++    cipher: &[u16],
++    nonce: u32,
++    aad: &[u8],
++) -> Result<Vec<u8>, JsValue>
+ ```
+ 
+-### Handshake Methods
++These return a `Result`, so authentication failure is distinguishable from a
++valid empty plaintext.
+ 
+-```javascript
+-// Alice — Step 1: generate keypair, broadcast public key
+-const pubkeyFlat = engine.generate_keys();
+-// Returns: Uint16Array(2048) — a.coeffs[1024] + b.coeffs[1024]
+-
+-// Bob — Step 2: receive Alice's pubkey, encapsulate seed
+-const cipherFlat = engine.encapsulate_seed(pubkeyFlat);
+-// Returns: Uint16Array(2048) — c1.coeffs[1024] + c2.coeffs[1024]
+-// Bob now has shared_seed internally
+-
+-// Alice — Step 3: receive Bob's ciphertext, recover seed
+-const ok = engine.decapsulate_seed(cipherFlat);
+-// Returns: boolean — true if decapsulation succeeded
+-// Alice now has shared_seed internally, identical to Bob's
+-```
++### 3. Bound chunk metadata in the browser client
+ 
+-### Nonce Management
++File:
+ 
+-```javascript
+-// Derive a deterministic starting nonce for this party
+-// party_index=0 (Alice), party_index=1 (Bob) ? disjoint nonce spaces
+-const nonceBase = engine.get_nonce_base(partyIndex);
+-let myNonce = nonceBase & 0x7FFFFFFF;  // mask to 31 bits
+-// Bit 31 is reserved for key confirmation messages only
++```text
++server.py
+ ```
+ 
+-### Encryption and Decryption
++The embedded JavaScript client now constructs AAD from the chunk envelope:
+ 
+ ```javascript
+-// Encrypt raw bytes — payload must be <= 31 bytes
+-const point = engine.encrypt_bytes(payload, nonce);
+-// Returns: Uint16Array(1024) — the NDCrypt ciphertext point
+-
+-// Decrypt
+-const bytes = engine.decrypt_bytes(point, nonce);
+-// Returns: Uint8Array — recovered payload bytes
+-
+-// String convenience wrappers (<=31 byte strings only)
+-const point = engine.encrypt_msg(text, nonce);
+-const text  = engine.decrypt_msg(point, nonce);
++function chunkAad(kind, transferId, chunkIndex, totalChunks, totalBytes) {
++  return encoder.encode(JSON.stringify({
++    kind,
++    transferId,
++    chunkIndex,
++    totalChunks,
++    totalBytes: totalBytes == null ? null : totalBytes,
++  }));
++}
+ ```
+ 
+----
+-
+-## Key Confirmation (MITM Prevention)
+-
+-<<<<<<< Updated upstream
+-After the handshake, both parties verify the exchange was not intercepted.
++Encryption uses:
+ 
++```javascript
++cryptoEngine.encrypt_bytes_aad(chunks[i], myNonce, aad)
+ ```
+-CONFIRM_TAG         = fixed byte sequence known to both clients
+-NONCE_CONFIRM_BOB   = 0x80000000  (bit 31 set — reserved nonce space)
+-NONCE_CONFIRM_ALICE = 0x80000001
+ 
+-Bob encrypts CONFIRM_TAG with NONCE_CONFIRM_BOB and sends it alongside his ciphertext.
++Decryption uses:
+ 
+-Alice decapsulates, derives the same seed, decrypts the confirmation — if it matches CONFIRM_TAG, Bob provably encapsulated against her real public key. A MITM who swapped the public key produces a different seed and cannot produce a matching confirmation. Alice then sends her own confirmation back. Only after both confirmations pass does either side mark the channel secure.
++```javascript
++cryptoEngine.decrypt_bytes_aad(arr, nonce, aad)
+ ```
+-=======
+ 
+-## Key Confirmation
++If an attacker changes `kind`, `transferId`, `chunkIndex`, `totalChunks`, or
++`totalBytes`, the receiver derives different AAD and the MAC verification fails.
+ 
+-After encapsulation, both peers perform a key-confirmation exchange using the
+-newly established shared seed.
++### 4. Added nonce replay rejection
+ 
+-Bob encrypts a fixed confirmation tag under the shared seed and sends it with
+-his encapsulation ciphertext. Alice decrypts and verifies the tag after
+-decapsulation, then returns her own confirmation.
++File:
+ 
+-This proves both peers derived the same session key before encrypted messaging
+-begins.
+-
+-**Important:** this confirms possession of the shared key, but does **not**
+-authenticate the remote user's identity. Without long-term identity keys,
+-certificates, or a trust-on-first-use (TOFU) mechanism, an active relay can
+-still impersonate another participant by initiating its own independent
+-handshake.
+->>>>>>> Stashed changes
+-
+----
+-
+-## Message and File Transfer Protocol
+-
+-Every transmission is chunked because NDCrypt carries at most 31 bytes per point.
+-
+-### Wire Format
+-
+-```json
+-{
+-  "type":        "ndcrypt",
+-  "kind":        "meta or data",
+-  "transferId":  12345,
+-  "chunkIndex":  0,
+-  "totalChunks": 47,
+-  "totalBytes":  1450,
+-  "nonce":       98234,
+-  "array":       [1024 u16 values]
+-}
++```text
++server.py
+ ```
+ 
+-kind, transferId, chunkIndex, totalChunks, totalBytes are plaintext. Chunk sequencing is not secret — only array carries encrypted content.
++The receiver tracks nonces seen in the current secure session:
+ 
+-### Transfer Flow
++```javascript
++const seenNonces = new Set();
++```
+ 
+-Every transfer sends two streams in parallel:
++Incoming encrypted chunks are rejected if:
+ 
+-**Meta stream** (kind: "meta") — encodes a small binary header describing the transfer:
+-- Text message: { k: 't', name: 'Alice' }
+-- File: { k: 'f', name: 'Alice', filename: 'photo.jpg', mime: 'image/jpeg', size: 148234 }
++- `nonce` is not an integer.
++- `nonce` is outside the application range.
++- `nonce` has already been seen.
+ 
+-**Data stream** (kind: "data") — the actual payload chunked into 31-byte pieces, each encrypted independently with a unique nonce.
++The set is cleared when a new key exchange is marked secure.
+ 
+-The receiver buffers chunks by (transferId, kind) in a sparse array keyed by chunkIndex. When all chunks arrive the stream is merged. When both meta and data are complete, the message or file is rendered.
++### 5. Added regression tests
+ 
+-### Capacity
++File:
+ 
++```text
++src/ndcrypt.rs
+ ```
+-Signal[0]     = length byte (masked)
+-Signal[1..31] = 31 payload bytes per chunk
+ 
+-Text (31 bytes):  1 chunk  ?  2 KB on wire
+-Text (310 bytes): 10 chunks ? 20 KB on wire
+-File (1 MB):      ~34,000 chunks ? ~136 MB on wire
+-```
++Tests added:
+ 
+-The expansion ratio (~66×) is the known cost of using NDCrypt directly for bulk data.
+-
+----
++```text
++authenticated_metadata_must_match
++empty_plaintext_is_distinct_from_authentication_failure
++poc_legacy_mac_allows_metadata_relabel_attack
++```
+ 
+-## Relay Server (server.py)
++## Validation
+ 
+-<<<<<<< Updated upstream
+-The Python WebSocket relay routes encrypted frames between peers. It enforces protocol structure but never inspects content.
+-=======
+-| Tag | Feature | Description |
+-|------|---------|-------------|
+-| S1 | Session pairing | Random 128-bit routing identifier used only to associate Bob's response with the correct Alice. It has no cryptographic meaning. |
+-| S3 | Origin allowlist | Rejects browser WebSocket connections whose Origin does not match the configured server host. |
+-| S4 | Rate limiting | Per-IP token bucket (200 message burst, 100 messages/sec sustained) sized for chunked file transfers while limiting abusive traffic. |
+-| S5 | Path traversal protection | Static files are constrained to the pkg/ directory using absolute-path validation. |
+-| S6 | Typed exception handling | Explicit exception types replace bare exception handlers. |
+-| S7 | Handshake state machine | Connections progress through IDLE ? PUBKEY_SENT ? COMPLETE. Invalid transitions terminate the connection. |
+->>>>>>> Stashed changes
++Run:
+ 
+-### Security Features
++```powershell
++cargo test
++```
+ 
+-| Tag | Feature | Description |
+-|---|---|---|
+-| S1 | Session pairing | Opaque session_id (random 32 hex chars) routes Bob's reply to the correct Alice. Carries no cryptographic meaning — real integrity is the confirmation round-trip |
+-| S3 | Origin allowlist | WebSocket upgrades rejected unless Origin matches server's own host. Computed once at startup, not per-connection |
+-| S4 | Rate limiting | Token bucket per IP: 20 msg/s burst, refills at 5/s. Flood silently dropped |
+-| S5 | Path traversal | Static files resolved against absolute pkg/ directory, checked with os.path.commonpath() |
+-| S6 | Typed exceptions | All bare except: replaced with typed handlers |
+-| S7 | State machine | Per-session IDLE ? PUBKEY_SENT ? COMPLETE. Out-of-order frames close the connection |
++Result:
+ 
+-### Handshake State Machine
++```text
++running 3 tests
++test ndcrypt::tests::authenticated_metadata_must_match ... ok
++test ndcrypt::tests::empty_plaintext_is_distinct_from_authentication_failure ... ok
++test ndcrypt::tests::poc_legacy_mac_allows_metadata_relabel_attack ... ok
+ 
++test result: ok. 3 passed; 0 failed
+ ```
+-IDLE
+-  ¦  receives pubkey
+-  ?
+-PUBKEY_SENT
+-  ¦  receives ciphertext (matching session_id)
+-  ?
+-COMPLETE
+-  ¦  normal ndcrypt messages flow
+-```
+-
+-### Message Validation
+ 
+-- pubkey.array: exactly 2048 elements
+-- ciphertext.array: exactly 2048 elements, confirm exactly 1024
+-- ndcrypt.array: exactly 1024 elements
+-- totalChunks: bounded by MAX_TOTAL_CHUNKS = 5,000,000
+-- chunkIndex: must be in [0, totalChunks)
+-- kind: must be "meta" or "data"
++## Other Findings From Review
+ 
+-### Nonce Space
++### Anonymous key exchange
+ 
+-```
+-Bits 0-30:  application message nonces
+-Bit 31:     reserved for key confirmation only
+-  0x80000000 = Bob's confirmation nonce
+-  0x80000001 = Alice's confirmation nonce
+-```
++The confirmation messages prove both peers derived the same session key. They do
++not prove the human identity of the remote peer.
+ 
+----
++An active relay can still impersonate participants by starting independent
++handshakes unless the application adds one of:
+ 
+-## File Structure
++- Long-term signing keys.
++- User-verifiable fingerprints.
++- TOFU identity binding.
++- Certificates or another external trust mechanism.
+ 
+-```
+-ndcrypt/
+-+-- Cargo.toml
+-+-- README.md
+-+-- src/
+-    +-- lib.rs        — WASM entry point, NDCryptWasm class
+-    +-- params.rs     — N, Q, SIGNAL_COUNT constants
+-    +-- gka.rs        — Ring arithmetic, pure Rust negacyclic NTT, S derivation 
+-    +-- keygen.rs     — Ring-LWE keypair generation
+-    +-- encrypt.rs    — Seed encapsulation (Bob)
+-    +-- decrypt.rs    — Seed decapsulation (Alice)
+-    +-- ndcrypt.rs    — Coordinate hiding encrypt/decrypt
+-
+-server.py             — Python WebSocket relay
+-pkg/                  — wasm-pack output (generated)
+-  +-- ndcrypt_bg.wasm
+-  +-- ndcrypt.js
+-```
++### Custom cryptography risk
+ 
+----
++NDCrypt uses a custom Ring-LWE-style KEM and custom message encryption layer.
++Even if the design is inspired by post-quantum primitives, it should not be
++described as proven post-quantum secure without:
+ 
+-## Build and Run
++- A concrete security reduction or parameter estimate.
++- Independent cryptographic review.
++- Test vectors.
++- Side-channel analysis.
++- Comparison against standardized schemes.
+ 
+-### Requirements
++For production post-quantum key establishment, prefer a standardized KEM such
++as ML-KEM.
+ 
+-```bash
+-# Install Rust
+-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
++### Nonce management remains sharp-edged
+ 
+-# Install wasm-pack
+-curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
++The internal `NdCryptSession` type increments nonces safely, but the public WASM
++API still exposes raw nonce arguments for compatibility:
+ 
+-# Install Python WebSocket library
+-pip install websockets
++```rust
++encrypt_bytes(payload, nonce)
++decrypt_bytes(cipher, nonce)
++encrypt_bytes_aad(payload, nonce, aad)
++decrypt_bytes_aad(cipher, nonce, aad)
+ ```
+ 
+-### Build WASM
++The browser client now increments and tracks nonces, but any external caller of
++the raw WASM API can still misuse the cipher by reusing `(seed, nonce)`.
+ 
+-```bash
+-wasm-pack build --target web
+-# Outputs pkg/ndcrypt.js and pkg/ndcrypt_bg.wasm
+-```
++Recommended future improvement:
+ 
+-### Run
++- Expose a stateful WASM session API that owns send and receive counters.
++- Avoid exposing low-level nonce-taking encryption methods to application code.
+ 
+-```bash
+-python server.py
+-# http://localhost:8080        local
+-# http://<your-ip>:8080        LAN peers
+-```
++### Metadata is still visible
+ 
+-### Cargo.toml
++This patch authenticates metadata. It does not hide metadata.
+ 
+-```toml
+-[lib]
+-crate-type = ["cdylib", "rlib"]
++The relay can still observe:
+ 
+-[dependencies]
+-wasm-bindgen = "0.2"
+-rand         = { version = "0.8", features = ["getrandom"] }
+-getrandom    = { version = "0.2", features = ["js"] }
+-sha3         = "0.10"
+-subtle       = "2"
+-zeroize      = "1"
+-```
+-
+----
++- Packet timing.
++- Transfer sizes.
++- Number of chunks.
++- Message frequency.
++- Connection patterns.
+ 
+-## Security Properties
++### Expansion ratio
+ 
+-### What the relay server learns
++Each encrypted point carries at most 31 plaintext bytes and serializes to 1040
++`u16` values after authentication. This is very large for file transfer. The
++protocol is better suited to small messages than bulk data.
+ 
+-- Public keys (a, b) — public by design
+-- Ciphertexts (c1, c2) — opaque without Alice's private key
+-- Nonces — public by design
+-- Encrypted NDCrypt arrays — 1024 uniform-looking values
+-- Chunk counts and transfer IDs — not secret
++## Threat Model After This Patch
+ 
+-The server learns nothing about message content, sender names, or file contents.
++### The relay can still do
+ 
+-### Security layers
++- Drop messages.
++- Delay messages.
++- Observe timing and chunk counts.
++- Refuse connections.
++- Attempt identity impersonation if users do not verify identities.
+ 
+-```
+-Layer 1 — Ring-LWE hardness
+-Breaking the handshake requires solving Ring-LWE in Z12289[x]/(x^1024+1).
+-Polynomial arithmetic is accelerated using an NTT implementation, but the
+-underlying Ring-LWE problem and security assumptions are unchanged.
+-
+-Layer 2 — Coordinate hiding
+-  Finding S requires searching C(1024,32) ˜ 2^210 subsets
+-  Quantum Grover reduces this to ˜ 2^105 — still infeasible
+-  Distribution matching ensures no statistical test distinguishes signal from noise
+-
+-Layer 3 — Key confirmation
+-  MITM who swaps the public key cannot produce a matching confirmation tag
+-  Both sides get positive proof before marking the channel secure
+-```
++### The relay should no longer be able to do
+ 
+-### Known Limitations
++- Relabel a valid chunk into a different transfer without detection.
++- Reorder chunks by editing `chunkIndex` without detection.
++- Change `kind`, `totalChunks`, or `totalBytes` without detection.
++- Replay the same nonce within a secure browser session without detection.
+ 
+-<<<<<<< Updated upstream
+-**IND-CPA only.** The Ring-LWE KEM does not include the Fujisaki-Okamoto transform. It provides IND-CPA security — adequate for ephemeral key exchange with forward secrecy, not IND-CCA2. Private keys must not be reused across sessions.
++## Recommended Next Steps
+ 
+-**StdRng.** gka.rs uses Rust's StdRng (ChaCha12) for the Fisher-Yates shuffle. Pinning to ChaCha20Rng via rand_chacha would make the algorithm explicit for production.
++1. Add authenticated identity.
++2. Replace the custom KEM with ML-KEM or clearly label this as experimental.
++3. Move nonce ownership fully into WASM session state.
++4. Add more tests for malformed ciphertexts, replay attempts, duplicate chunk
++   indices, and end-to-end browser message handling.
++5. Remove or clearly deprecate compatibility APIs that return empty plaintext on
++   failure.
+ 
+-**Expansion ratio.** NDCrypt produces 2048 bytes of ciphertext per 31 bytes of plaintext (~66× expansion). For large file transfers this is significant. The protocol is designed for secure messaging.
++## How To Review This Branch
+ 
+-**Two-party only.** One Alice and one Bob per session. Group chat requires a separate key agreement protocol.
+-=======
+-- **Anonymous key exchange.** The current protocol confirms that both peers derived the same shared session key, but it does not authenticate peer identities. Adding long-term signing keys, certificates, or TOFU fingerprints would provide authenticated key exchange.
++Run the POC:
+ 
+-- **Replay protection.** Application messages currently rely on nonce uniqueness but do not maintain a replay window. Future versions should reject duplicate nonces.
++```powershell
++cargo test poc_legacy_mac_allows_metadata_relabel_attack -- --nocapture
++```
+ 
+-- **IND-CPA KEM.** The Ring-LWE encapsulation does not currently implement the Fujisaki–Okamoto transform, so it provides IND-CPA rather than IND-CCA2 security.
++Run the full test suite:
+ 
+-- **Ciphertext expansion.** Each encrypted point carries at most 31 plaintext bytes, resulting in approximately 66× expansion for bulk data. The protocol is intended primarily for secure messaging rather than high-throughput file transport.
++```powershell
++cargo test
++```
+ 
+-- **Two-party sessions.** The protocol currently supports a single sender and receiver. Multi-party communication would require an additional group key agreement protocol.
++Inspect the patch:
+ 
+-- **Metadata visibility.** Although message contents remain encrypted, the relay observes packet timing, message frequency, chunk counts, transfer sizes, and connection patterns.
++```powershell
++git show --stat
++git show
++```
+-- 
+2.42.0.windows.2
+
